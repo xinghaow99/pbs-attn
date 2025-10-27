@@ -41,7 +41,8 @@ python setup.py install
 cd ..
 ```
 
-## Example Usage
+## 🔧 Example Usage
+You can patch the forward function for efficient prefill as following:
 ```
 from pbs_attn.patch.huggingface import apply_patch_with_prefill, get_permuted_block_sparse_attn_fwd
 from transformers import AutoModelForCausalLM, AutoTokenizer

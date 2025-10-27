@@ -169,8 +169,18 @@ def permuted_block_sparse_attn_fwd(
     batch_size, num_kv_heads, kv_len, head_dim = key_states.shape
     assert num_q_heads == num_kv_heads
     assert causal
-    
+    assert q_len == kv_len
 
+    # Fall back to regular attention if not permuting
+    if q_len <= segment_size:
+        attn_outputs = torch.nn.functional.scaled_dot_product_attention(
+            query_states,
+            key_states,
+            value_states,
+            is_causal=causal,
+        )
+        return attn_outputs
+    
     # PBS: 1. Permutation Phase
     perm_key_states, perm_key_indices = apply_permutation(
         query_states=query_states,

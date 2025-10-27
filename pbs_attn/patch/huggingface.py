@@ -322,8 +322,7 @@ def is_model_supported(model):
 def main():
     """Main function to load a Llama-style or Qwen model, apply the patch, and run a test."""
     # Choose model: Llama or Qwen
-    # model_name = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"  # Llama example
-    model_name = "Qwen/Qwen2.5-7B-Instruct"  # Qwen example
+    model_name = "meta-llama/Llama-3.1-8B-Instruct"
     print(f"Loading model and tokenizer for '{model_name}'...")
 
     model = AutoModelForCausalLM.from_pretrained(
@@ -392,7 +391,7 @@ def main():
     pbs_fn = get_permuted_block_sparse_attn_fwd(
         block_size=128,
         segment_size=256,
-        threshold=0.99,
+        threshold=0.9,
         force_select_first_block=True,
         use_triton=True
     )

@@ -86,14 +86,6 @@ class MinferenceHuggingFaceCausalLM(PatchedHuggingFaceCausalLM):
 
 
 @MODELS.register_module()
-class ABSHuggingFaceCausalLM(PatchedHuggingFaceCausalLM):
-    """HuggingFace CausalLM with ABS (Accurate Block Selection) sparse attention."""
-    def __init__(self, path: str, **kwargs):
-        patch_kwargs = kwargs.pop('patch_kwargs', {})
-        super().__init__(path=path, patch_type='abs', patch_kwargs=patch_kwargs, **kwargs)
-
-
-@MODELS.register_module()
 class XAttentionHuggingFaceCausalLM(PatchedHuggingFaceCausalLM):
     """HuggingFace CausalLM with XAttention sparse attention."""
     def __init__(self, path: str, **kwargs):

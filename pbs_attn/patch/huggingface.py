@@ -205,10 +205,7 @@ def patched_attention_forward(
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
-        # repeat kv to match q heads locally (GQA)
         kv_repeat = max(1, local_num_q_heads // max(1, local_num_kv_heads))
-        key_states = repeat_kv(key_states, kv_repeat)
-        value_states = repeat_kv(value_states, kv_repeat)
 
         # 4. Call the configured prefill kernel
         if prefill_fn is None:
@@ -216,8 +213,16 @@ def patched_attention_forward(
         else:
             # For kernels that require layer_idx, add it to the call
             kernel_fn = prefill_fn.func if isinstance(prefill_fn, partial) else prefill_fn
+            prefill_kwargs = {}
+            if 'num_key_value_groups' in kernel_fn.__code__.co_varnames:
+                prefill_kwargs['num_key_value_groups'] = kv_repeat
+            else:
+                key_states = repeat_kv(key_states, kv_repeat)
+                value_states = repeat_kv(value_states, kv_repeat)
             if 'layer_idx' in kernel_fn.__code__.co_varnames:
-                attn_output = prefill_fn(query_states, key_states, value_states, layer_idx=self.layer_idx)
+                prefill_kwargs['layer_idx'] = self.layer_idx
+            if prefill_kwargs:
+                attn_output = prefill_fn(query_states, key_states, value_states, **prefill_kwargs)
             else:
                 attn_output = prefill_fn(query_states, key_states, value_states)
 
@@ -407,5 +412,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-    

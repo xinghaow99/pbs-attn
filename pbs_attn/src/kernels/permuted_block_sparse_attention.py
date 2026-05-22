@@ -2,6 +2,7 @@ import torch
 import triton
 import triton.language as tl
 import math
+import os
 
 
 @triton.jit
@@ -10,17 +11,15 @@ def _permuted_block_sparse_attn_fwd_inner(
     q,
     qo_len,
     kv_len,
-    K_ptrs,
-    V_ptrs,
+    K_base,
+    V_base,
     K_block_indices_ptrs,
     perm_Q_indices_ptrs,
     perm_K_indices_ptrs,
-    perm_V_indices_ptrs,
-    stride_seq_k,
-    stride_seq_v,
+    stride_seq_k, stride_d_k,
+    stride_seq_v, stride_d_v,
     stride_bz_perm_q_indices, stride_h_perm_q_indices, stride_seq_perm_q_indices,
     stride_bz_perm_k_indices, stride_h_perm_k_indices, stride_seq_perm_k_indices,
-    stride_bz_perm_v_indices, stride_h_perm_v_indices, stride_seq_perm_v_indices,
     pid_seq,
     RANGE_Q_SEQ,
     RANGE_KV_SEQ,
@@ -46,10 +45,8 @@ def _permuted_block_sparse_attn_fwd_inner(
         lo, hi = 0, kv_len
         # perm_Q_indices = None
 
-    K_ptrs_cur = tl.advance(K_ptrs, (0, lo))
-    V_ptrs_cur = tl.advance(V_ptrs, (lo, 0))
     perm_K_indices_ptrs_cur = tl.advance(perm_K_indices_ptrs, (0, lo))
-    
+    head_offsets = tl.arange(0, HEAD_DIM)
 
     if not (STAGE == 1 and segment_id == 0):
         for kv_seq_start in range(lo, hi, BLOCK_N):
@@ -57,12 +54,17 @@ def _permuted_block_sparse_attn_fwd_inner(
             if k_block_idx:
 
                 kv_mask = RANGE_KV_SEQ[None, :] >= (kv_len - kv_seq_start) # True if exceed kv_len 
-                k = tl.load(K_ptrs_cur, boundary_check=(0,1), padding_option="zero") # (BLOCK_N, HEAD_DIM)
-                qk = tl.dot(q, k) 
+                perm_K_indices = tl.load(
+                    perm_K_indices_ptrs_cur, boundary_check=(0,1), padding_option="zero"
+                )
+                k_rows = perm_K_indices.reshape((BLOCK_N,))
+                k_inbounds = k_rows < kv_len
+                k_offsets = k_rows[:, None] * stride_seq_k + head_offsets[None, :] * stride_d_k
+                k = tl.load(K_base + k_offsets, mask=k_inbounds[:, None], other=0.0).to(dtype)
+                qk = tl.dot(q, tl.trans(k)) 
                 qk *= softmax_scale
                 if STAGE == 2:
                     # On-diagonal segments, apply mask within segment
-                    perm_K_indices = tl.load(perm_K_indices_ptrs_cur, boundary_check=(0,1), padding_option="zero")
                     mask = perm_Q_indices < perm_K_indices # (BLOCK_M, BLOCK_N)
                     kv_mask |= mask
 
@@ -76,15 +78,14 @@ def _permuted_block_sparse_attn_fwd_inner(
                 alpha = tl.math.exp2(m_i-m_ij)
 
                 acc = acc * alpha[:, None]
-                v = tl.load(V_ptrs_cur, boundary_check=(0,1), padding_option="zero")
+                v_offsets = k_rows[:, None] * stride_seq_v + head_offsets[None, :] * stride_d_v
+                v = tl.load(V_base + v_offsets, mask=k_inbounds[:, None], other=0.0).to(dtype)
                 p = p.to(dtype)
 
                 acc += tl.dot(p, v)
                 l_i = l_i * alpha + l_ij
                 m_i = m_ij
             
-            K_ptrs_cur = tl.advance(K_ptrs_cur, (0, BLOCK_N))
-            V_ptrs_cur = tl.advance(V_ptrs_cur, (BLOCK_N, 0))
             perm_K_indices_ptrs_cur = tl.advance(perm_K_indices_ptrs_cur, (0, BLOCK_N))
     
     return acc, l_i, m_i
@@ -113,31 +114,45 @@ def _prune_invalid_configs_permuted(configs, named_args, **kwargs):
     return pruned
 
 
-@triton.autotune(
-    configs=[
-        # Basic configurations
-        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'num_warps': 4, 'num_stages': 2}),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32, 'num_warps': 4, 'num_stages': 2}),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'num_warps': 4, 'num_stages': 2}),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'num_warps': 8, 'num_stages': 2}),
+_PERMUTED_FULL_AUTOTUNE_CONFIGS = [
+    triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'num_warps': 4, 'num_stages': 2}),
+    triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32, 'num_warps': 4, 'num_stages': 2}),
+    triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'num_warps': 4, 'num_stages': 2}),
+    triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'num_warps': 8, 'num_stages': 2}),
+    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'num_warps': 4, 'num_stages': 2}),
+    triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'num_warps': 4, 'num_stages': 2}),
+    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'num_warps': 8, 'num_stages': 2}),
+    triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'num_warps': 8, 'num_stages': 3}),
+    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'num_warps': 8, 'num_stages': 3}),
+]
+_PERMUTED_FIXED_CONFIG = [
+    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'num_warps': 8, 'num_stages': 2}),
+]
+_PBS_NO_AUTOTUNE = os.environ.get("PBS_NO_AUTOTUNE", "false").lower() in ("1", "true", "yes")
+_PBS_FULL_AUTOTUNE = os.environ.get("PBS_FULL_AUTOTUNE", "true").lower() in ("1", "true", "yes")
 
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'num_warps': 4, 'num_stages': 2}),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'num_warps': 4, 'num_stages': 2}),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'num_warps': 8, 'num_stages': 2}),
-        # Configurations with more stages for potential latency hiding
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'num_warps': 8, 'num_stages': 3}),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'num_warps': 8, 'num_stages': 3}),
-   ],
-    key=['H', 'HEAD_DIM', 'LOGICAL_BLOCK_SIZE', 'SEGMENT_SIZE', 'num_kv_groups'],
+
+@triton.autotune(
+    configs=(
+        _PERMUTED_FULL_AUTOTUNE_CONFIGS
+        if _PBS_FULL_AUTOTUNE and not _PBS_NO_AUTOTUNE
+        else _PERMUTED_FIXED_CONFIG
+    ),
+    key=[
+        'autotune_h',
+        'autotune_head_dim',
+        'autotune_logical_block_size',
+        'autotune_segment_size',
+        'autotune_num_kv_groups',
+    ],
     prune_configs_by={'early_config_prune': _prune_invalid_configs_permuted},
 )
 @triton.jit
 def _permuted_block_sparse_attn_fwd(
-    perm_Q, perm_K, perm_V, perm_O, # (batch_size, num_q_heads(num_kv_heads), q_len(kv_len), head_dim)
+    perm_Q, K, V, perm_O, # (batch_size, num_q_heads(num_kv_heads), q_len(kv_len), head_dim)
     K_block_indices, # (batch_size, num_q_heads, num_q_blocks, num_k_blocks)
     perm_Q_indices, # (batch_size, num_q_heads, q_len)
     perm_K_indices, # (batch_size, num_kv_heads, kv_len)
-    perm_V_indices, # (batch_size, num_kv_heads, kv_len)
     stride_bz_q, stride_h_q, stride_seq_q, stride_d_q,
     stride_bz_k, stride_h_k, stride_seq_k, stride_d_k,
     stride_bz_v, stride_h_v, stride_seq_v, stride_d_v,
@@ -145,9 +160,13 @@ def _permuted_block_sparse_attn_fwd(
     stride_bz_k_block_indices, stride_h_k_block_indices, stride_seqq_k_block_indices, stride_seqk_k_block_indices,
     stride_bz_perm_q_indices, stride_h_perm_q_indices, stride_seq_perm_q_indices,
     stride_bz_perm_k_indices, stride_h_perm_k_indices, stride_seq_perm_k_indices,
-    stride_bz_perm_v_indices, stride_h_perm_v_indices, stride_seq_perm_v_indices,
     qo_len, kv_len,
     softmax_scale,
+    autotune_h,
+    autotune_head_dim,
+    autotune_logical_block_size,
+    autotune_segment_size,
+    autotune_num_kv_groups,
     H:tl.constexpr,
     num_kv_groups:tl.constexpr, 
     HEAD_DIM: tl.constexpr,
@@ -168,7 +187,6 @@ def _permuted_block_sparse_attn_fwd(
 
     range_Q_seq = pid_seq * BLOCK_M + tl.arange(0, BLOCK_M)
     range_KV_seq = tl.arange(0, BLOCK_N)
-    range_h = tl.arange(0, HEAD_DIM)
 
     dtype = perm_Q.type.element_ty
 
@@ -181,22 +199,8 @@ def _permuted_block_sparse_attn_fwd(
         block_shape=(BLOCK_M, HEAD_DIM),
         order=(1, 0)
     )
-    K_ptrs = tl.make_block_ptr(
-        base=perm_K + pid_bz * stride_bz_k + (pid_h // num_kv_groups) * stride_h_k,
-        shape=(HEAD_DIM, kv_len),
-        strides=(stride_d_k, stride_seq_k),
-        offsets=(0, 0),
-        block_shape=(HEAD_DIM, BLOCK_N),
-        order=(1, 0)
-    )
-    V_ptrs = tl.make_block_ptr(
-        base=perm_V + pid_bz * stride_bz_v + (pid_h // num_kv_groups) * stride_h_v,
-        shape=(kv_len, HEAD_DIM),
-        strides=(stride_seq_v, stride_d_v),
-        offsets=(0, 0),
-        block_shape=(BLOCK_N, HEAD_DIM),
-        order=(1, 0)
-    )
+    K_base = K + pid_bz * stride_bz_k + pid_h * stride_h_k
+    V_base = V + pid_bz * stride_bz_v + (pid_h // num_kv_groups) * stride_h_v
     O_ptrs = tl.make_block_ptr(
         base=perm_O + pid_bz * stride_bz_o + pid_h * stride_h_o,
         shape=(qo_len, HEAD_DIM),
@@ -228,14 +232,6 @@ def _permuted_block_sparse_attn_fwd(
         block_shape=(tl.constexpr(1), BLOCK_N),
         order=(1, 0)
     )
-    perm_V_indices_ptrs = tl.make_block_ptr(
-        base=perm_V_indices + pid_bz*stride_bz_perm_v_indices + pid_h*stride_h_perm_v_indices,
-        shape=(kv_len, tl.constexpr(1)),
-        strides=(stride_seq_perm_v_indices, tl.constexpr(0)),
-        offsets=(0, 0),
-        block_shape=(BLOCK_N, tl.constexpr(1)),
-        order=(1, 0)
-    )
 
     # Init accumulators
     m_i = tl.zeros((BLOCK_M,), dtype=tl.float32) - float("inf")
@@ -252,17 +248,15 @@ def _permuted_block_sparse_attn_fwd(
         q,
         qo_len,
         kv_len,
-        K_ptrs,
-        V_ptrs, 
+        K_base,
+        V_base, 
         K_block_indices_ptrs,
         perm_Q_indices_ptrs,
         perm_K_indices_ptrs,
-        perm_V_indices_ptrs,
-        stride_seq_k,
-        stride_seq_v,
+        stride_seq_k, stride_d_k,
+        stride_seq_v, stride_d_v,
         stride_bz_perm_q_indices, stride_h_perm_q_indices, stride_seq_perm_q_indices,
         stride_bz_perm_k_indices, stride_h_perm_k_indices, stride_seq_perm_k_indices,
-        stride_bz_perm_v_indices, stride_h_perm_v_indices, stride_seq_perm_v_indices,
         pid_seq,
         range_Q_seq,
         range_KV_seq,
@@ -283,17 +277,15 @@ def _permuted_block_sparse_attn_fwd(
             q,
             qo_len,
             kv_len,
-            K_ptrs,
-            V_ptrs, 
+            K_base,
+            V_base, 
             K_block_indices_ptrs,
             perm_Q_indices_ptrs,
             perm_K_indices_ptrs,
-            perm_V_indices_ptrs,
-            stride_seq_k,
-            stride_seq_v,
+            stride_seq_k, stride_d_k,
+            stride_seq_v, stride_d_v,
             stride_bz_perm_q_indices, stride_h_perm_q_indices, stride_seq_perm_q_indices,
             stride_bz_perm_k_indices, stride_h_perm_k_indices, stride_seq_perm_k_indices,
-            stride_bz_perm_v_indices, stride_h_perm_v_indices, stride_seq_perm_v_indices,
             pid_seq,
             range_Q_seq,
             range_KV_seq,

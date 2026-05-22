@@ -290,13 +290,15 @@ def main(script_args, method_args):
         print(f"Results saved to {file_path}")
 
 
-    # Clean up distributed state
+    # Some cluster NCCL setups hang in destroy_process_group after work completes.
+    # Keep the default cleanup path, but allow eval-only runs to skip destroy.
     if dist.is_available() and dist.is_initialized():
         try:
             dist.barrier()
         except Exception:
             pass
-        dist.destroy_process_group()
+        if os.environ.get("PBS_SKIP_DIST_DESTROY") != "1":
+            dist.destroy_process_group()
 
 if __name__ == "__main__":
     parser = HfArgumentParser(ScriptArguments)
@@ -316,5 +318,4 @@ if __name__ == "__main__":
         method_args = sub_parser.parse_args_into_dataclasses(args=remaining_args)[0]
 
     main(script_args, method_args)
-
 

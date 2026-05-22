@@ -25,6 +25,66 @@ def first_token_mask(
     return first_token_mask[:, :, None, :]
 
 
+_BLOCK_MASK_LAYOUT_CACHE = {}
+
+
+def _get_block_mask_layout(
+    q_block_num: int,
+    kv_block_num: int,
+    num_blocks_per_segment: int,
+    causal: bool,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    key = (q_block_num, kv_block_num, num_blocks_per_segment, bool(causal), str(device))
+    cached = _BLOCK_MASK_LAYOUT_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    q_block_indices = torch.arange(q_block_num, device=device).unsqueeze(1)
+    kv_block_indices = torch.arange(kv_block_num, device=device).unsqueeze(0)
+    segment_mask = (q_block_indices // num_blocks_per_segment) == (
+        kv_block_indices // num_blocks_per_segment
+    )
+    mask = ~segment_mask
+    if causal:
+        causal_mask = kv_block_indices <= q_block_indices + (kv_block_num - q_block_num)
+        mask = mask & causal_mask
+
+    _BLOCK_MASK_LAYOUT_CACHE[key] = (mask, segment_mask)
+    return mask, segment_mask
+
+
+def _repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
+    if n_rep == 1:
+        return hidden_states
+    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
+    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+
+
+def _gather_permuted_values(
+    value_states: torch.Tensor,
+    perm_key_indices: torch.Tensor,
+    num_key_value_groups: int,
+) -> torch.Tensor:
+    batch_size, num_kv_heads, kv_len, head_dim = value_states.shape
+    _, num_q_heads, perm_len = perm_key_indices.shape
+
+    if num_key_value_groups == 1:
+        gather_indices = perm_key_indices.unsqueeze(-1).expand(-1, -1, -1, head_dim)
+        return torch.gather(value_states, 2, gather_indices)
+
+    kv_head_indices = (
+        torch.arange(num_q_heads, device=perm_key_indices.device, dtype=perm_key_indices.dtype)
+        // num_key_value_groups
+    )
+    flat_indices = perm_key_indices + (kv_head_indices * kv_len).view(1, num_q_heads, 1)
+    flat_indices = flat_indices.reshape(batch_size, num_q_heads * perm_len)
+
+    flat_values = value_states.contiguous().view(batch_size, num_kv_heads * kv_len, head_dim)
+    flat_indices = flat_indices.unsqueeze(-1).expand(-1, -1, head_dim)
+    return torch.gather(flat_values, 1, flat_indices).view(batch_size, num_q_heads, perm_len, head_dim)
+
 
 def permuted_block_selection(
     permuted_query_states: torch.Tensor,
@@ -69,14 +129,8 @@ def permuted_block_selection(
     
     if q_num_to_pad > 0:
         padded_query_states = torch.nn.functional.pad(permuted_query_states, (0, 0, 0, q_num_to_pad), value=0)
-        pad_indices = torch.arange(q_len, q_len + q_num_to_pad, device=permuted_query_states.device)
-        pad_indices = pad_indices.unsqueeze(0).unsqueeze(0).expand(batch_size, num_q_heads, -1)
-        pad_query_indices = torch.cat([query_indices, pad_indices], dim=-1)
-
     else:
         padded_query_states = permuted_query_states
-        pad_query_indices = query_indices
-        pad_indices = None
         
     if kv_num_to_pad > 0:
         padded_key_states = torch.nn.functional.pad(permuted_key_states, (0, 0, 0, kv_num_to_pad), value=0)
@@ -86,7 +140,6 @@ def permuted_block_selection(
     else:
         padded_key_states = permuted_key_states
         pad_key_indices = key_indices
-        pad_indices = None
         
     padded_q_len = q_len + q_num_to_pad
     padded_kv_len = kv_len + kv_num_to_pad
@@ -96,15 +149,13 @@ def permuted_block_selection(
     kv_block_num = padded_kv_len // block_size
     num_blocks_per_segment = segment_size // block_size
 
-    mask = torch.ones(q_block_num, kv_block_num, device=permuted_query_states.device, dtype=torch.bool)
-    q_block_indices = torch.arange(q_block_num, device=permuted_query_states.device).unsqueeze(1)
-    kv_block_indices = torch.arange(kv_block_num, device=permuted_key_states.device).unsqueeze(0)
-    segment_mask = (q_block_indices // num_blocks_per_segment) == (kv_block_indices // num_blocks_per_segment)
-
-    mask &= ~segment_mask
-    if causal:
-        causal_mask = kv_block_indices <= q_block_indices + (kv_block_num - q_block_num)
-        mask &= causal_mask
+    mask, segment_mask = _get_block_mask_layout(
+        q_block_num,
+        kv_block_num,
+        num_blocks_per_segment,
+        causal,
+        permuted_query_states.device,
+    )
 
     # PBS: 2.3 Block Selection (Mean Pooling & Attention)
     block_attn_scores = block_pooled_attn(
@@ -124,7 +175,7 @@ def permuted_block_selection(
         
     if force_select_first_block:
         # block_mask[:, :, :, 0] = True
-        block_mask |= first_token_mask(pad_key_indices, block_size)
+        block_mask = block_mask | first_token_mask(pad_key_indices, block_size)
         
 
     return block_attn_scores, block_mask, segment_mask
@@ -143,6 +194,7 @@ def permuted_block_sparse_attn_fwd(
     # BLOCK_N: int = 64,
     query_pool_mode: str = "mean",
     key_pool_mode: str = "mean",
+    num_key_value_groups: int = 1,
 ):
     """
     Perform permuted block sparse attention forward pass.
@@ -167,12 +219,16 @@ def permuted_block_sparse_attn_fwd(
 
     batch_size, num_q_heads, q_len, head_dim = query_states.shape
     batch_size, num_kv_heads, kv_len, head_dim = key_states.shape
-    assert num_q_heads == num_kv_heads
+    assert num_key_value_groups >= 1
+    assert num_q_heads == num_kv_heads * num_key_value_groups
     assert causal
     assert q_len == kv_len
 
     # Fall back to regular attention if not permuting
     if q_len <= segment_size:
+        if num_key_value_groups > 1:
+            key_states = _repeat_kv(key_states, num_key_value_groups)
+            value_states = _repeat_kv(value_states, num_key_value_groups)
         attn_outputs = torch.nn.functional.scaled_dot_product_attention(
             query_states,
             key_states,
@@ -180,11 +236,16 @@ def permuted_block_sparse_attn_fwd(
             is_causal=causal,
         )
         return attn_outputs
+
+    if num_key_value_groups > 1:
+        key_states_expanded = _repeat_kv(key_states, num_key_value_groups)
+    else:
+        key_states_expanded = key_states
     
     # PBS: 1. Permutation Phase
     perm_key_states, perm_key_indices = apply_permutation(
         query_states=query_states,
-        key_states=key_states,
+        key_states=key_states_expanded,
         block_size=block_size,
         segment_size=segment_size,
     )
@@ -205,38 +266,39 @@ def permuted_block_sparse_attn_fwd(
         query_pool_mode=query_pool_mode,
         key_pool_mode=key_pool_mode,
     )
+    del block_attn_scores
 
     block_mask = block_mask | segment_mask[None, None, :, :]
+    del segment_mask
 
-    # PBS: 3. Value Permutation
-    # Permute value states using the same indices as key states to keep them aligned
-    indices_for_gather = perm_key_indices.unsqueeze(-1).expand(-1, -1, -1, head_dim)
-    perm_value_states = torch.gather(value_states, 2, indices_for_gather)
-    perm_value_indices = perm_key_indices
-
-    # PBS: 4. Attention Computation
-    num_kv_groups = num_q_heads // num_kv_heads
+    # PBS: 3. Attention Computation
     perm_attn_outputs = torch.empty_like(perm_query_states, device=perm_query_states.device)
     if use_triton:
+        del perm_key_states
+
         def grid(META):
             return (triton.cdiv(q_len, META["BLOCK_M"]), num_q_heads, batch_size)
 
         _permuted_block_sparse_attn_fwd[grid](
-            perm_query_states, perm_key_states, perm_value_states, perm_attn_outputs,
+            perm_query_states, key_states_expanded, value_states, perm_attn_outputs,
             block_mask,
-            perm_query_indices, perm_key_indices, perm_value_indices,
+            perm_query_indices, perm_key_indices,
             perm_query_states.stride(0), perm_query_states.stride(1), perm_query_states.stride(2), perm_query_states.stride(3),
-            perm_key_states.stride(0), perm_key_states.stride(1), perm_key_states.stride(2), perm_key_states.stride(3),
-            perm_value_states.stride(0), perm_value_states.stride(1), perm_value_states.stride(2), perm_value_states.stride(3),
+            key_states_expanded.stride(0), key_states_expanded.stride(1), key_states_expanded.stride(2), key_states_expanded.stride(3),
+            value_states.stride(0), value_states.stride(1), value_states.stride(2), value_states.stride(3),
             perm_attn_outputs.stride(0), perm_attn_outputs.stride(1), perm_attn_outputs.stride(2), perm_attn_outputs.stride(3),
             block_mask.stride(0), block_mask.stride(1), block_mask.stride(2), block_mask.stride(3),
             perm_query_indices.stride(0), perm_query_indices.stride(1), perm_query_indices.stride(2),
             perm_key_indices.stride(0), perm_key_indices.stride(1), perm_key_indices.stride(2),
-            perm_value_indices.stride(0), perm_value_indices.stride(1), perm_value_indices.stride(2),
             q_len, kv_len,
             1/math.sqrt(head_dim),
+            num_q_heads,
+            head_dim,
+            LOGICAL_BLOCK_SIZE,
+            SEGMENT_SIZE,
+            num_key_value_groups,
             H=num_q_heads,
-            num_kv_groups=num_kv_groups,
+            num_kv_groups=num_key_value_groups,
             HEAD_DIM=head_dim,
             # BLOCK_M,
             # BLOCK_N,
@@ -245,6 +307,12 @@ def permuted_block_sparse_attn_fwd(
             STAGE=3 if causal else 1,
         )
     else:
+        perm_value_states = _gather_permuted_values(
+            value_states,
+            perm_key_indices,
+            num_key_value_groups,
+        )
+        perm_value_indices = perm_key_indices
         perm_attn_outputs = _permuted_block_sparse_attn_fwd_torch_naive(
             perm_query_states, perm_key_states, perm_value_states, perm_attn_outputs,
             perm_query_indices, perm_key_indices, perm_value_indices,
